@@ -6,6 +6,7 @@ use std::{
     str::Utf8Error,
 };
 
+#[derive(Clone)]
 struct Span {
     offset: usize,
     len: usize,
@@ -26,44 +27,54 @@ impl Span {
     }
 }
 
+#[derive(Clone)]
 pub struct Record {
     data: Vec<u8>,
     spans: Vec<Span>,
 }
 
 impl Record {
-    fn parse(bufread: &mut impl BufRead, separator: u8) -> io::Result<Self> {
-        let mut res = Self {
+    fn new() -> Self {
+        Self {
             data: Vec::new(),
             spans: Vec::new(),
-        };
+        }
+    }
+
+    fn parse(&mut self, bufread: &mut impl BufRead, separator: u8) -> io::Result<()> {
+        self.data.clear();
+        self.spans.clear();
         let mut carry = None;
         loop {
             let buff = bufread.fill_buf()?;
             let buff_len = buff.len();
             if buff.is_empty() {
                 if let Some(span) = carry {
-                    res.spans.push(span);
+                    self.spans.push(span);
                 }
-                return Ok(res);
+                return Ok(());
             }
             let mut start = 0;
             let end = memchr::memchr2_iter(separator, b'\n', buff).find(|&pos| {
-                let span = Span::extend(carry.take(), res.data.len(), pos - start);
-                res.data.extend_from_slice(&buff[start..pos]);
-                res.spans.push(span);
+                let span = Span::extend(carry.take(), self.data.len(), pos - start);
+                self.data.extend_from_slice(&buff[start..pos]);
+                self.spans.push(span);
                 start = pos + 1;
                 buff[pos] == b'\n'
             });
             match end {
                 None => {
-                    carry = Some(Span::extend(carry.take(), res.data.len(), buff_len - start));
-                    res.data.extend_from_slice(&buff[start..]);
+                    carry = Some(Span::extend(
+                        carry.take(),
+                        self.data.len(),
+                        buff_len - start,
+                    ));
+                    self.data.extend_from_slice(&buff[start..]);
                     bufread.consume(buff_len);
                 }
                 Some(pos) => {
                     bufread.consume(pos + 1);
-                    return Ok(res);
+                    return Ok(());
                 }
             }
         }
@@ -170,6 +181,7 @@ pub struct Parser<R: BufRead> {
     header: Header,
     bufread: R,
     separator: u8,
+    record: Record,
 }
 
 impl Parser<BufReader<File>> {
@@ -199,27 +211,24 @@ impl<R: BufRead> Parser<R> {
     }
 
     pub fn with_separator(mut bufread: R, separator: u8) -> io::Result<Self> {
-        let record = Record::parse(&mut bufread, separator)?;
+        let mut record = Record::new();
+        record.parse(&mut bufread, separator)?;
         let header = Header::new(record).map_err(utf8_to_io_error)?;
         Ok(Self {
             header,
             bufread,
             separator,
+            record: Record::new(),
         })
     }
 
     pub fn header(&self) -> &Header {
         &self.header
     }
-}
 
-impl<R: BufRead> Iterator for Parser<R> {
-    type Item = io::Result<Record>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Record::parse(&mut self.bufread, self.separator)
-            .map(|record| (!record.is_empty()).then_some(record))
-            .transpose()
+    pub fn read_record(&mut self) -> io::Result<Option<&Record>> {
+        self.record.parse(&mut self.bufread, self.separator)?;
+        Ok((!self.record.is_empty()).then_some(&self.record))
     }
 }
 
@@ -233,19 +242,19 @@ mod tests {
         let data = b"a,b,c\n1,2,3\n4,5,6\n".to_vec();
         let mut parser = Parser::from_reader(Cursor::new(data)).unwrap();
 
-        let record = parser.next().expect("first record").unwrap();
+        let record = parser.read_record().unwrap().expect("first record");
         assert_eq!(record.len(), 3);
         assert_eq!(record.get(0), Some(&b"1"[..]));
         assert_eq!(record.get(1), Some(&b"2"[..]));
         assert_eq!(record.get(2), Some(&b"3"[..]));
 
-        let record = parser.next().expect("second record").unwrap();
+        let record = parser.read_record().unwrap().expect("second record");
         assert_eq!(record.len(), 3);
         assert_eq!(record.get(0), Some(&b"4"[..]));
         assert_eq!(record.get(1), Some(&b"5"[..]));
         assert_eq!(record.get(2), Some(&b"6"[..]));
 
-        assert!(parser.next().is_none());
+        assert!(parser.read_record().unwrap().is_none());
     }
 
     #[test]
@@ -253,28 +262,28 @@ mod tests {
         let data = b"a,b\n1,2\n3,4".to_vec();
         let mut parser = Parser::from_reader(Cursor::new(data)).unwrap();
 
-        let record = parser.next().expect("first record").unwrap();
+        let record = parser.read_record().unwrap().expect("first record");
         assert_eq!(record.get(0), Some(&b"1"[..]));
         assert_eq!(record.get(1), Some(&b"2"[..]));
 
-        let record = parser.next().expect("second record").unwrap();
+        let record = parser.read_record().unwrap().expect("second record");
         assert_eq!(record.get(0), Some(&b"3"[..]));
         assert_eq!(record.get(1), Some(&b"4"[..]));
 
-        assert!(parser.next().is_none());
+        assert!(parser.read_record().unwrap().is_none());
     }
 
     #[test]
     fn iterates_record_fields() {
         let data = b"a,b,c\n1,2,3\n".to_vec();
         let mut parser = Parser::from_reader(Cursor::new(data)).unwrap();
-        let record = parser.next().expect("record").unwrap();
+        let record = parser.read_record().unwrap().expect("record");
 
-        let fields: Vec<&[u8]> = (&record).into_iter().collect();
+        let fields: Vec<&[u8]> = record.into_iter().collect();
         assert_eq!(fields, vec![&b"1"[..], &b"2"[..], &b"3"[..]]);
 
         let mut count = 0;
-        for _ in &record {
+        for _ in record {
             count += 1;
         }
         assert_eq!(count, 3);
@@ -287,13 +296,12 @@ mod tests {
 
         assert_eq!(parser.header().index_of("year"), Some(2));
         assert_eq!(parser.header().index_of("missing"), None);
+        let geo_count = parser.header().index_of("geo_count").unwrap();
+        let area = parser.header().index_of("Area").unwrap();
 
-        let record = parser.next().expect("record").unwrap();
-        assert_eq!(parser.header().get(&record, "geo_count"), Some(&b"81"[..]));
-        assert_eq!(
-            parser.header().get_str(&record, "Area").unwrap().unwrap(),
-            "A100100"
-        );
+        let record = parser.read_record().unwrap().expect("record");
+        assert_eq!(record.get(geo_count), Some(&b"81"[..]));
+        assert_eq!(record.get_str(area).unwrap().unwrap(), "A100100");
     }
 
     #[test]
@@ -301,7 +309,7 @@ mod tests {
         let data = b"h1,h2\naaaaaaaaaaaa,b\n".to_vec();
         let reader = std::io::BufReader::with_capacity(4, Cursor::new(data));
         let mut parser = Parser::new(reader).unwrap();
-        let record = parser.next().expect("record").unwrap();
+        let record = parser.read_record().unwrap().expect("record");
         assert_eq!(record.get(0), Some(&b"aaaaaaaaaaaa"[..]));
         assert_eq!(record.get(1), Some(&b"b"[..]));
     }
@@ -312,9 +320,25 @@ mod tests {
         let mut parser = Parser::from_reader_with_separator(Cursor::new(data), b';').unwrap();
         assert_eq!(parser.header().index_of("b"), Some(1));
 
-        let record = parser.next().expect("record").unwrap();
+        let record = parser.read_record().unwrap().expect("record");
         assert_eq!(record.get(0), Some(&b"1"[..]));
         assert_eq!(record.get(1), Some(&b"2"[..]));
         assert_eq!(record.get(2), Some(&b"3"[..]));
+    }
+
+    #[test]
+    fn reuses_buffer_across_read_record_calls() {
+        let data = b"a,b\n1,22\n333,4\n".to_vec();
+        let mut parser = Parser::from_reader(Cursor::new(data)).unwrap();
+
+        let record = parser.read_record().unwrap().expect("first record");
+        assert_eq!(record.get(0), Some(&b"1"[..]));
+        assert_eq!(record.get(1), Some(&b"22"[..]));
+
+        let record = parser.read_record().unwrap().expect("second record");
+        assert_eq!(record.get(0), Some(&b"333"[..]));
+        assert_eq!(record.get(1), Some(&b"4"[..]));
+
+        assert!(parser.read_record().unwrap().is_none());
     }
 }
