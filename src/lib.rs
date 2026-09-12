@@ -32,7 +32,7 @@ pub struct Record {
 }
 
 impl Record {
-    fn parse(bufread: &mut impl BufRead) -> io::Result<Self> {
+    fn parse(bufread: &mut impl BufRead, separator: u8) -> io::Result<Self> {
         let mut res = Self {
             data: Vec::new(),
             spans: Vec::new(),
@@ -48,7 +48,7 @@ impl Record {
                 return Ok(res);
             }
             let mut start = 0;
-            let end = memchr::memchr2_iter(b',', b'\n', buff).find(|&pos| {
+            let end = memchr::memchr2_iter(separator, b'\n', buff).find(|&pos| {
                 let span = Span::extend(carry.take(), res.data.len(), pos - start);
                 res.data.extend_from_slice(&buff[start..pos]);
                 res.spans.push(span);
@@ -164,29 +164,48 @@ impl Header {
     }
 }
 
+pub const DEFAULT_SEPARATOR: u8 = b',';
+
 pub struct Parser<R: BufRead> {
     header: Header,
     bufread: R,
+    separator: u8,
 }
 
 impl Parser<BufReader<File>> {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_separator(path, DEFAULT_SEPARATOR)
+    }
+
+    pub fn open_with_separator(path: impl AsRef<Path>, separator: u8) -> io::Result<Self> {
         let f = File::open(path)?;
-        Self::from_reader(f)
+        Self::from_reader_with_separator(f, separator)
     }
 }
 
 impl<R: Read> Parser<BufReader<R>> {
     pub fn from_reader(reader: R) -> io::Result<Self> {
-        Self::new(BufReader::new(reader))
+        Self::from_reader_with_separator(reader, DEFAULT_SEPARATOR)
+    }
+
+    pub fn from_reader_with_separator(reader: R, separator: u8) -> io::Result<Self> {
+        Self::with_separator(BufReader::new(reader), separator)
     }
 }
 
 impl<R: BufRead> Parser<R> {
-    pub fn new(mut bufread: R) -> io::Result<Self> {
-        let record = Record::parse(&mut bufread)?;
+    pub fn new(bufread: R) -> io::Result<Self> {
+        Self::with_separator(bufread, DEFAULT_SEPARATOR)
+    }
+
+    pub fn with_separator(mut bufread: R, separator: u8) -> io::Result<Self> {
+        let record = Record::parse(&mut bufread, separator)?;
         let header = Header::new(record).map_err(utf8_to_io_error)?;
-        Ok(Self { header, bufread })
+        Ok(Self {
+            header,
+            bufread,
+            separator,
+        })
     }
 
     pub fn header(&self) -> &Header {
@@ -198,7 +217,7 @@ impl<R: BufRead> Iterator for Parser<R> {
     type Item = io::Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Record::parse(&mut self.bufread)
+        Record::parse(&mut self.bufread, self.separator)
             .map(|record| (!record.is_empty()).then_some(record))
             .transpose()
     }
@@ -285,5 +304,17 @@ mod tests {
         let record = parser.next().expect("record").unwrap();
         assert_eq!(record.get(0), Some(&b"aaaaaaaaaaaa"[..]));
         assert_eq!(record.get(1), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn parses_with_custom_separator() {
+        let data = b"a;b;c\n1;2;3\n".to_vec();
+        let mut parser = Parser::from_reader_with_separator(Cursor::new(data), b';').unwrap();
+        assert_eq!(parser.header().index_of("b"), Some(1));
+
+        let record = parser.next().expect("record").unwrap();
+        assert_eq!(record.get(0), Some(&b"1"[..]));
+        assert_eq!(record.get(1), Some(&b"2"[..]));
+        assert_eq!(record.get(2), Some(&b"3"[..]));
     }
 }
