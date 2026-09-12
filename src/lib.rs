@@ -11,6 +11,21 @@ struct Span {
     len: usize,
 }
 
+impl Span {
+    fn extend(carry: Option<Self>, fresh_offset: usize, extra_len: usize) -> Self {
+        match carry {
+            Some(Span { offset, len }) => Span {
+                offset,
+                len: len + extra_len,
+            },
+            None => Span {
+                offset: fresh_offset,
+                len: extra_len,
+            },
+        }
+    }
+}
+
 pub struct Record {
     data: Vec<u8>,
     spans: Vec<Span>,
@@ -24,7 +39,6 @@ impl Record {
         };
         let mut carry = None;
         loop {
-            let mut start = 0;
             let buff = bufread.fill_buf()?;
             let buff_len = buff.len();
             if buff.is_empty() {
@@ -33,33 +47,17 @@ impl Record {
                 }
                 return Ok(res);
             }
-            let end = memchr::memchr2_iter(b',', b'\n', buff).find_map(|pos| {
-                let span = if let Some(Span { offset, len }) = carry.take() {
-                    Span {
-                        offset,
-                        len: len + (pos - start),
-                    }
-                } else {
-                    Span {
-                        offset: res.data.len(),
-                        len: pos - start,
-                    }
-                };
+            let mut start = 0;
+            let end = memchr::memchr2_iter(b',', b'\n', buff).find(|&pos| {
+                let span = Span::extend(carry.take(), res.data.len(), pos - start);
                 res.data.extend_from_slice(&buff[start..pos]);
                 res.spans.push(span);
                 start = pos + 1;
-                match buff[pos] {
-                    b',' => None,
-                    b'\n' => Some(pos),
-                    _ => unreachable!(),
-                }
+                buff[pos] == b'\n'
             });
             match end {
                 None => {
-                    carry = Some(Span {
-                        offset: res.data.len(),
-                        len: buff_len - start,
-                    });
+                    carry = Some(Span::extend(carry.take(), res.data.len(), buff_len - start));
                     res.data.extend_from_slice(&buff[start..]);
                     bufread.consume(buff_len);
                 }
@@ -277,5 +275,15 @@ mod tests {
             parser.header().get_str(&record, "Area").unwrap().unwrap(),
             "A100100"
         );
+    }
+
+    #[test]
+    fn preserves_field_spanning_multiple_buffer_refills() {
+        let data = b"h1,h2\naaaaaaaaaaaa,b\n".to_vec();
+        let reader = std::io::BufReader::with_capacity(4, Cursor::new(data));
+        let mut parser = Parser::new(reader).unwrap();
+        let record = parser.next().expect("record").unwrap();
+        assert_eq!(record.get(0), Some(&b"aaaaaaaaaaaa"[..]));
+        assert_eq!(record.get(1), Some(&b"b"[..]));
     }
 }
